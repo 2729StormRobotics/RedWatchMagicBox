@@ -10,17 +10,24 @@ import com.revrobotics.spark.config.SparkMaxConfig;
 import com.revrobotics.spark.FeedbackSensor;
 import com.revrobotics.spark.config.SparkBaseConfig.IdleMode;
 import com.revrobotics.spark.SparkBase.ControlType;
+import com.revrobotics.RelativeEncoder;
 
-import edu.wpi.first.wpilibj2.command.SubsystemBase;
+import edu.wpi.first.math.MathUtil;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
+import edu.wpi.first.wpilibj2.command.SubsystemBase;
 
 /**
- * Turret Subsystem utilizing Chinese Remainder Theorem (CRT) with 19T and 21T gears.
- * Updated for REVLib 2026 (2025.x.x) Specifications.
+ * Turret Subsystem utilizing Chinese Remainder Theorem (CRT) Logic.
  * * Hardware:
- * - Motor: NEO on SparkMax ID 12, geared 4:1 to a 19T pinion.
- * - Primary Encoder: Absolute encoder on SparkMax ID 12 (19T pinion).
- * - Auxiliary Encoder: Absolute encoder on SparkMax ID 11 (21T pinion).
+ * - Motor: NEO on SparkMax ID 12 (19T Pinion)
+ * - Sensor 1: Absolute Encoder on 19T Pinion (Main Motor)
+ * - Sensor 2: Absolute Encoder on 21T Idler (Aux SparkMax ID 11)
+ * - Main Turret Ring: 200T
+ * * Strategy:
+ * 1. Read absolute encoders on startup (Expecting 0.0 - 1.0 range).
+ * 2. Use Brute-Force/Iterative logic to determine absolute Turret angle.
+ * 3. Seed the internal NEO relative encoder with this absolute angle.
+ * 4. Run PID control on the internal relative encoder (which doesn't wrap).
  */
 public class Turret extends SubsystemBase {
     private final SparkMax m_motor;
@@ -28,6 +35,7 @@ public class Turret extends SubsystemBase {
     
     private final SparkAbsoluteEncoder m_encoder19;
     private final SparkAbsoluteEncoder m_encoder21;
+    private final RelativeEncoder m_internalEncoder;
     
     private final SparkClosedLoopController m_closedLoopController;
 
@@ -35,17 +43,20 @@ public class Turret extends SubsystemBase {
     private final double k_turretRingTeeth = 200.0; 
     private final double k_gear19 = 19.0;
     private final double k_gear21 = 21.0;
-    private final double k_totalRangeTeeth = 19.0 * 21.0; // 399 teeth
+    
+    // The pattern repeats every LCM(19, 21) = 399 encoder teeth.
+    // 399 encoder teeth / 200 turret teeth = ~1.995 Turret Rotations of unique range.
+    // This covers approx +/- 359 degrees.
+    private final double k_uniqueRangeRotations = (k_gear19 * k_gear21) / k_turretRingTeeth;
 
     // Soft Limit Constants (Degrees)
     private final double k_forwardSoftLimit = 350.0;
     private final double k_reverseSoftLimit = -350.0;
-
-    // Store position conversion factor for CRT calculations
-    private final double m_positionConversionFactor;
     
-    // Track the offset between encoder reading and absolute position
-    private double m_encoderOffset = 0.0;
+    // PID Constants
+    private final double kP = 0.05;
+    private final double kI = 0.0;
+    private final double kD = 0.0;
 
     private double m_targetAngle = 0.0;
 
@@ -55,185 +66,173 @@ public class Turret extends SubsystemBase {
 
         m_encoder19 = m_motor.getAbsoluteEncoder();
         m_encoder21 = m_auxSpark.getAbsoluteEncoder();
+        m_internalEncoder = m_motor.getEncoder();
 
         m_closedLoopController = m_motor.getClosedLoopController();
 
-        /*
-         * REVLib 2026 Configuration Pattern:
-         * We create a config object, apply settings, and then push to the controller.
-         */
         SparkMaxConfig motorConfig = new SparkMaxConfig();
         SparkMaxConfig auxConfig = new SparkMaxConfig();
 
-        // Position Conversion: 1 rotation of encoder = (19 / RingTeeth) * 360 degrees
-        m_positionConversionFactor = (k_gear19 / k_turretRingTeeth) * 360.0;
-
+        // 1. Configure Main Motor (19T)
         motorConfig
             .idleMode(IdleMode.kBrake)
             .inverted(false);
 
+        // Configure Internal Encoder (Relative) for Control
+        // The internal encoder counts rotations of the motor shaft.
+        // We convert this to Degrees of the Turret.
+        // Gear Ratio = 200 (Turret) / 19 (Pinion) = 10.526...
+        // 10.526 motor rotations = 360 degrees turret.
+        double positionFactor = 360.0 / (k_turretRingTeeth / k_gear19);
+        double velocityFactor = positionFactor / 60.0;
+
+        motorConfig.encoder
+            .positionConversionFactor(positionFactor)
+            .velocityConversionFactor(velocityFactor);
+
+        // Configure Absolute Encoder for Reading
+        // CONFIRMED: We set factor to 1.0, so getPosition() returns 0.0 to 1.0.
+        // This represents one full rotation of the 19T gear.
         motorConfig.absoluteEncoder
-            .positionConversionFactor(m_positionConversionFactor)
-            .velocityConversionFactor(m_positionConversionFactor / 60.0);
+            .positionConversionFactor(1.0) 
+            .velocityConversionFactor(1.0);
 
+        // PID controls the Internal Relative Encoder, NOT the wrapping absolute encoder
         motorConfig.closedLoop
-            .feedbackSensor(FeedbackSensor.kAbsoluteEncoder)
-            .p(0.1)
-            .i(0.0)
-            .d(0.0)
-            .outputRange(-1.0, 1.0);
+            .feedbackSensor(FeedbackSensor.kPrimaryEncoder) 
+            .p(kP)
+            .i(kI)
+            .d(kD)
+            .outputRange(-0.5, 0.5); // Safe speed limit for testing
 
-        // Apply configs with Persist and Reset to ensure clean state
-        m_motor.configure(motorConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
+        // Soft Limits
+        motorConfig.softLimit
+            .forwardSoftLimit(k_forwardSoftLimit)
+            .forwardSoftLimitEnabled(true)
+            .reverseSoftLimit(k_reverseSoftLimit)
+            .reverseSoftLimitEnabled(true);
+
+        // 2. Configure Aux Motor (21T) - Sensor Only
+        // CONFIRMED: We set factor to 1.0, so getPosition() returns 0.0 to 1.0.
+        auxConfig.absoluteEncoder
+            .positionConversionFactor(1.0)
+            .velocityConversionFactor(1.0);
         
-        // Setup Aux Spark as a simple sensor node (Minimize CAN traffic)
-        auxConfig.absoluteEncoder.positionConversionFactor(1.0); // Raw rotations for CRT
+        // Apply configurations
+        m_motor.configure(motorConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
         m_auxSpark.configure(auxConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
 
+        // 3. Calculate Absolute Position and Seed Internal Encoder
         resetToAbsolute();
     }
 
     /**
-     * Uses the Chinese Remainder Theorem to find the absolute physical position
-     * of the turret without homing.
+     * Uses an Iterative Search (Best Fit) to find the absolute position.
+     * This is more robust than direct formula CRT for noisy sensors.
      */
     public void resetToAbsolute() {
-        // Get raw encoder positions (0.0 to 1.0 rotations)
-        // Encoder 19 returns position in degrees (after conversion factor)
-        // We need raw rotations for CRT, so divide by conversion factor
-        double r19 = m_encoder19.getPosition() / m_positionConversionFactor;
-        // Encoder 21 is configured with raw rotations (conversion factor = 1.0)
+        // 1. Get raw rotations [0.0, 1.0)
+        // These are the fractional rotations of each gear.
+        double r19 = m_encoder19.getPosition(); 
         double r21 = m_encoder21.getPosition();
 
-        // Normalize to tooth remainders (ensuring positive modulo for robustness)
-        double a19 = ((r19 % 1.0) + 1.0) % 1.0 * k_gear19;
-        double a21 = ((r21 % 1.0) + 1.0) % 1.0 * k_gear21;
-
-        // CRT Solver for 19 and 21 (Co-prime)
-        // Using extended Euclidean algorithm coefficients:
-        // For moduli 19 and 21: 19*10 + 21*(-9) = 1
-        // So: x = (a19 * 21 * 10 + a21 * 19 * 10) mod 399
-        double x = (a19 * 21 * 10 + a21 * 19 * 10) % k_totalRangeTeeth;
-        if (x < 0) x += k_totalRangeTeeth; // Ensure positive
-
-        // Convert teeth to degrees
-        double absoluteDegrees = (x / k_turretRingTeeth) * 360.0;
+        // 2. Iterative Search
+        // The 19T gear rotates 21 times before the pattern with the 21T gear repeats perfectly.
+        // We check all "k" values from 0 to 20 to see which total rotation count for the 19T gear
+        // aligns with the current reading of the 21T gear.
         
-        // Logic to center the turret (assuming 0 is "forward")
-        if (absoluteDegrees > 180.0) absoluteDegrees -= 360.0;
+        double bestError = Double.MAX_VALUE;
+        double bestTurretDegrees = 0.0;
 
-        // Store the offset between encoder reading and calculated absolute position
-        // This allows us to convert encoder readings to absolute positions
-        double currentReading = m_encoder19.getPosition();
-        m_encoderOffset = currentReading - absoluteDegrees;
+        // Loop through possible full rotations of the 19T gear
+        for (int k = 0; k < 21; k++) {
+            // Hypothetical total rotations of 19T gear
+            // e.g. 5 full rotations + 0.3 partial rotation
+            double totalRotations19 = k + r19;
+
+            // Calculate resulting Turret Rotations for this hypothesis
+            // (Total 19 Rotations) / (Gear Ratio 200/19) = Turret Rotations
+            double turretRotations = totalRotations19 / (k_turretRingTeeth / k_gear19);
+
+            // Calculate Expected 21T Encoder Value for this Turret Angle
+            // (Turret Rotations) * (Gear Ratio 200/21) = Total 21 Rotations
+            double totalRotations21 = turretRotations * (k_turretRingTeeth / k_gear21);
+            
+            // Get the fractional part (0.0 - 1.0) expected for the 21T encoder
+            double expectedR21 = totalRotations21 % 1.0;
+            if (expectedR21 < 0) expectedR21 += 1.0;
+
+            // Calculate Error (cyclic distance between expected and actual r21)
+            double error = Math.abs(r21 - expectedR21);
+            if (error > 0.5) error = 1.0 - error; // Handle wrap (0.99 vs 0.01 is error 0.02)
+
+            if (error < bestError) {
+                bestError = error;
+                bestTurretDegrees = turretRotations * 360.0;
+            }
+        }
+
+        // Safety check for sensor health
+        if (bestError > 0.05) { // 5% of a rotation error is quite high (18 degrees on the gear)
+            System.err.println("[Turret] WARNING: High CRT Error: " + bestError + ". Sensors may be slipping or offset.");
+        }
+
+        // 3. Center the Result
+        // The unique range is ~718 degrees (0 to 718).
+        // We map this to match our physical setup, e.g., -359 to +359.
+        // Assuming 0 is "forward", and the range wraps around back.
+        double maxUniqueDeg = k_uniqueRangeRotations * 360.0; // ~718.2 degrees
         
-        m_targetAngle = absoluteDegrees;
+        // If the calculated value is very large (e.g., > 360), it corresponds to negative angles
+        if (bestTurretDegrees > (maxUniqueDeg / 2.0)) {
+            bestTurretDegrees -= maxUniqueDeg;
+        }
+
+        // 4. Seed the internal encoder
+        // This makes the PID controller think we are at the correct absolute angle
+        // without worrying about the absolute encoders wrapping 0-1 constantly.
+        m_internalEncoder.setPosition(bestTurretDegrees);
+        m_targetAngle = bestTurretDegrees;
+        
+        System.out.println("Turret Seeded: " + bestTurretDegrees + " deg (Fit Error: " + bestError + ")");
     }
 
     /**
      * Sets the target angle for the turret to aim at.
-     * Automatically clamps to soft limits.
-     * @param degrees target angle in degrees.
      */
     public void setAngle(double degrees) {
-        m_targetAngle = Math.max(k_reverseSoftLimit, Math.min(k_forwardSoftLimit, degrees));
-        // Use setReference with position control (deprecated but functional)
-        // Alternative: use m_closedLoopController.setPosition() if available
+        m_targetAngle = MathUtil.clamp(degrees, k_reverseSoftLimit, k_forwardSoftLimit);
         m_closedLoopController.setSetpoint(m_targetAngle, ControlType.kPosition);
     }
 
     /**
-     * Sets the turret motor to a percentage output.
-     * Useful for manual control or testing.
-     * @param speed percentage output from -1.0 to 1.0
+     * Manual control percentage.
      */
     public void setPercentOutput(double speed) {
-        // Clamp speed to safe range
-        speed = Math.max(-1.0, Math.min(1.0, speed));
-        m_motor.set(speed);
+        m_motor.set(MathUtil.clamp(speed, -1.0, 1.0));
     }
 
-    /**
-     * Gets the current absolute angle of the turret.
-     * Uses the stored offset to convert encoder reading to absolute position.
-     * @return current angle in degrees
-     */
     public double getCurrentAngle() {
-        return m_encoder19.getPosition() - m_encoderOffset;
+        return m_internalEncoder.getPosition();
     }
 
-    /**
-     * Checks if the turret is at the target angle within tolerance.
-     * @param tolerance tolerance in degrees (default 1.0)
-     * @return true if within tolerance
-     */
     public boolean atTarget(double tolerance) {
         return Math.abs(getCurrentAngle() - m_targetAngle) < tolerance;
     }
 
-    /**
-     * Checks if the turret is at the target angle within default tolerance (1.0 degrees).
-     * @return true if within tolerance
-     */
-    public boolean atTarget() {
-        return atTarget(1.0);
-    }
-
-    /**
-     * Gets the angle error (target - current).
-     * @return angle error in degrees
-     */
-    public double getAngleError() {
-        return m_targetAngle - getCurrentAngle();
-    }
-
-    /**
-     * Gets the target angle.
-     * @return target angle in degrees
-     */
-    public double getTargetAngle() {
-        return m_targetAngle;
-    }
-
-    /**
-     * Stops the turret motor.
-     */
     public void stop() {
-        m_motor.set(0.0);
+        m_motor.stopMotor();
     }
 
-    /**
-     * Checks if the requested angle is within soft limits.
-     * @param angle angle to check in degrees
-     * @return true if within limits
-     */
-    public boolean isWithinLimits(double angle) {
-        return angle >= k_reverseSoftLimit && angle <= k_forwardSoftLimit;
-    }
-
-    /**
-     * Gets the raw encoder position for the 19T gear (for debugging).
-     * @return raw encoder position
-     */
-    public double getRawEncoder19() {
-        return m_encoder19.getPosition();
-    }
-
-    /**
-     * Gets the raw encoder position for the 21T gear (for debugging).
-     * @return raw encoder position
-     */
-    public double getRawEncoder21() {
-        return m_encoder21.getPosition();
-    }
+    // Debug accessors
+    public double getRawAbs19() { return m_encoder19.getPosition(); }
+    public double getRawAbs21() { return m_encoder21.getPosition(); }
 
     @Override
     public void periodic() {
-        SmartDashboard.putNumber("Turret/Current Angle", getCurrentAngle());
-        SmartDashboard.putNumber("Turret/Target Angle", m_targetAngle);
-        SmartDashboard.putNumber("Turret/Angle Error", getAngleError());
-        SmartDashboard.putBoolean("Turret/At Target", atTarget());
-        SmartDashboard.putNumber("Turret/Raw Encoder 19", getRawEncoder19());
-        SmartDashboard.putNumber("Turret/Raw Encoder 21", getRawEncoder21());
+        SmartDashboard.putNumber("Turret/Angle", getCurrentAngle());
+        SmartDashboard.putNumber("Turret/Target", m_targetAngle);
+        SmartDashboard.putNumber("Turret/Abs 19", getRawAbs19());
+        SmartDashboard.putNumber("Turret/Abs 21", getRawAbs21());
     }
 }
