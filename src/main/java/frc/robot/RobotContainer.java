@@ -19,7 +19,7 @@ public class RobotContainer {
     // 2. Controllers
     // Replaced XboxController with CommandJoystick for Logitech Extreme 3D Pro / x30
     // Port 0 is usually the first joystick plugged in.
-    private final CommandJoystick m_driverJoystick = new CommandJoystick(0);
+    private final CommandJoystick m_driverJoystick = new CommandJoystick(1);
 
     /**
      * The container for the robot. Contains subsystems, OI devices, and commands.
@@ -85,29 +85,29 @@ public class RobotContainer {
 
         // Button 5 (Top Left): Aim Left (-90)
         m_driverJoystick.button(5)
-            .onTrue(new InstantCommand(() -> m_turret.setAngle(-90.0), m_turret));
+            .whileTrue(new InstantCommand(() -> m_turret.setAngle(-90.0), m_turret));
 
         // Button 6 (Top Right): Aim Right (90)
         m_driverJoystick.button(6)
-            .onTrue(new InstantCommand(() -> m_turret.setAngle(90.0), m_turret));
+            .whileTrue(new InstantCommand(() -> m_turret.setAngle(90.0), m_turret));
 
         // ========== POV (Hat Switch) CONTROLS ==========
         
         // POV Up (0 deg): Aim Forward
         m_driverJoystick.pov(0)
-            .onTrue(new InstantCommand(() -> m_turret.setAngle(0.0), m_turret));
+            .whileTrue(new InstantCommand(() -> m_turret.setAngle(0.0), m_turret));
 
         // POV Right (90 deg): Aim Right
         m_driverJoystick.pov(90)
-            .onTrue(new InstantCommand(() -> m_turret.setAngle(90.0), m_turret));
+            .whileTrue(new InstantCommand(() -> m_turret.setAngle(90.0), m_turret));
 
         // POV Down (180 deg): Aim Back
         m_driverJoystick.pov(180)
-            .onTrue(new InstantCommand(() -> m_turret.setAngle(180.0), m_turret));
+            .whileTrue(new InstantCommand(() -> m_turret.setAngle(180.0), m_turret));
 
         // POV Left (270 deg): Aim Left
         m_driverJoystick.pov(270)
-            .onTrue(new InstantCommand(() -> m_turret.setAngle(-90.0), m_turret));
+            .whileTrue(new InstantCommand(() -> m_turret.setAngle(-90.0), m_turret));
     }
 
     /**
