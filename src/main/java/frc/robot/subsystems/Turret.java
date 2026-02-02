@@ -1,24 +1,27 @@
 package frc.robot.subsystems;
 
+import java.util.function.DoubleSupplier;
+
 import com.revrobotics.spark.SparkMax;
 import com.revrobotics.spark.SparkLowLevel.MotorType;
-import com.revrobotics.spark.SparkClosedLoopController;
 import com.revrobotics.spark.SparkAbsoluteEncoder;
 import com.revrobotics.spark.SparkBase.PersistMode;
 import com.revrobotics.spark.SparkBase.ResetMode;
 import com.revrobotics.spark.config.SparkMaxConfig;
-import com.revrobotics.spark.FeedbackSensor;
 import com.revrobotics.spark.config.SparkBaseConfig.IdleMode;
-import com.revrobotics.spark.SparkBase.ControlType;
 import com.revrobotics.RelativeEncoder;
 
 import edu.wpi.first.math.MathUtil;
+import edu.wpi.first.math.controller.ProfiledPIDController;
+import edu.wpi.first.math.trajectory.TrapezoidProfile;
 import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
+import edu.wpi.first.wpilibj2.command.Command;
+import edu.wpi.first.wpilibj2.command.Commands;
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
 
 /**
  * Turret Subsystem utilizing Chinese Remainder Theorem (CRT) Logic.
- * Updated to use MAXMotion for smooth profiling.
+ * Uses RIO-side ProfiledPIDController for smooth motion (replacing SparkMax MAXMotion).
  */
 public class Turret extends SubsystemBase {
     private final SparkMax m_motor;
@@ -28,7 +31,12 @@ public class Turret extends SubsystemBase {
     private final SparkAbsoluteEncoder m_encoder21;
     private final RelativeEncoder m_internalEncoder;
     
-    private final SparkClosedLoopController m_closedLoopController;
+    // RIO-Side PID Controller with Motion Profiling
+    // Constraints: Max Velocity (deg/s), Max Acceleration (deg/s^2)
+    private final TrapezoidProfile.Constraints m_constraints = 
+        new TrapezoidProfile.Constraints(500.0, 600.0);
+    private final ProfiledPIDController m_pidController = 
+        new ProfiledPIDController(0.048, 0.0, 0.0, m_constraints);
 
     // Gear Constants
     private final double k_turretRingTeeth = 200.0; 
@@ -45,21 +53,9 @@ public class Turret extends SubsystemBase {
     // Soft Limit Constants (Degrees)
     private final double k_forwardSoftLimit = 360.0;
     private final double k_reverseSoftLimit = -360.0;
-    
-    // PID & MAXMotion Constants
-    // MAXMotion needs aggressive P because the "Target" moves smoothly.
-    private final double kP = 0.2; 
-    private final double kI = 0.0; // Usually not needed with MAXMotion
-    private final double kD = 0.0;
-    private final double kFF = 0.015; // Small feedforward helps maintain velocity
-    
-    // Motion Profile Limits
-    private final double kMaxVelocity = 300.0; // Degrees per second
-    private final double kMaxAccel = 600.0;    // Degrees per second squared
 
+    // Internal state
     private double m_targetAngle = 0.0;
-
-    // Variables for Dashboard Debugging
     private double m_lastCrtError = 0.0;
 
     public Turret() {
@@ -69,8 +65,6 @@ public class Turret extends SubsystemBase {
         m_encoder19 = m_motor.getAbsoluteEncoder();
         m_encoder21 = m_auxSpark.getAbsoluteEncoder();
         m_internalEncoder = m_motor.getEncoder();
-
-        m_closedLoopController = m_motor.getClosedLoopController();
 
         SparkMaxConfig motorConfig = new SparkMaxConfig();
         SparkMaxConfig auxConfig = new SparkMaxConfig();
@@ -94,20 +88,6 @@ public class Turret extends SubsystemBase {
             .positionConversionFactor(1.0) 
             .velocityConversionFactor(1.0);
 
-        // Configure PID + MAXMotion
-        motorConfig.closedLoop
-            .feedbackSensor(FeedbackSensor.kPrimaryEncoder) 
-            .p(kP)
-            .i(kI)
-            .d(kD)
-            .velocityFF(kFF)
-            .outputRange(-1.0, 1.0);
-
-        motorConfig.closedLoop.maxMotion
-            .maxVelocity(kMaxVelocity)
-            .maxAcceleration(kMaxAccel)
-            .allowedClosedLoopError(1.0); // Allow 1 degree of error
-
         // Soft Limits
         motorConfig.softLimit
             .forwardSoftLimit(k_forwardSoftLimit)
@@ -124,9 +104,75 @@ public class Turret extends SubsystemBase {
         m_motor.configure(motorConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
         m_auxSpark.configure(auxConfig, ResetMode.kResetSafeParameters, PersistMode.kPersistParameters);
 
-        // 3. Calculate Absolute Position
+        // 3. Setup PID Tolerance
+        m_pidController.setTolerance(1.0); // 1 degree tolerance
+
+        // 4. Calculate Absolute Position
         resetToAbsolute();
     }
+
+    // =========================================================================
+    //                        COMMAND FACTORIES
+    // =========================================================================
+
+    /**
+     * Command: Holds the turret at a specific angle using Motion Profiling.
+     * This command never finishes (it holds the angle), so use it with .onTrue() or as a Default Command.
+     */
+    public Command runToAngleCommand(double degrees) {
+        return run(() -> {
+            // 1. Clamp Target
+            m_targetAngle = MathUtil.clamp(degrees, k_reverseSoftLimit, k_forwardSoftLimit);
+            
+            // 2. Calculate Output
+            // The ProfiledPIDController creates a smooth path from current to target
+            double output = m_pidController.calculate(getCurrentAngle(), m_targetAngle);
+            
+            // 3. Apply Output
+            m_motor.set(MathUtil.clamp(output, -1.0, 1.0));
+        })
+        .beforeStarting(() -> {
+            // Reset the profile to start at the current speed and position
+            m_pidController.reset(getCurrentAngle());
+        })
+        .withName("RunToAngle: " + degrees);
+    }
+
+    /**
+     * Command: Runs the turret with manual joystick control.
+     */
+    public Command manualControlCommand(DoubleSupplier speedSupplier) {
+        return run(() -> {
+            double speed = speedSupplier.getAsDouble();
+            // Deadband
+            if (Math.abs(speed) < 0.1) speed = 0.0;
+            
+            // Scale speed (50% max for manual safety)
+            m_motor.set(speed * 0.5);
+        })
+        .withName("ManualTurret");
+    }
+
+    /**
+     * Command: Resets the turret to absolute position using CRT.
+     * Runs once then finishes.
+     */
+    public Command resetToAbsoluteCommand() {
+        return runOnce(this::resetToAbsolute).withName("ResetToAbsolute");
+    }
+
+    /**
+     * Command: Stops the motor.
+     */
+    public Command stopCommand() {
+        return runOnce(m_motor::stopMotor).withName("StopTurret");
+    }
+
+
+
+    // =========================================================================
+    //                           LOGIC & METHODS
+    // =========================================================================
 
     private double[] calculateAbsAngle() {
         double r19 = (m_encoder19.getPosition() - k_enc19Offset);
@@ -177,28 +223,17 @@ public class Turret extends SubsystemBase {
         m_internalEncoder.setPosition(angle);
         m_targetAngle = angle;
         
-        // Use MAXMotion Control Type
-        m_closedLoopController.setReference(m_targetAngle, ControlType.kMAXMotionPositionControl);
+        // Reset PID state so it doesn't jump
+        m_pidController.reset(angle);
         
         System.out.println("Turret Seeded: " + angle + " deg (Fit Error: " + error + ")");
     }
 
-    public void setAngle(double degrees) {
-        m_targetAngle = MathUtil.clamp(degrees, k_reverseSoftLimit, k_forwardSoftLimit);
-        // CHANGED: Use MAXMotion Position Control
-        m_closedLoopController.setReference(m_targetAngle, ControlType.kMAXMotionPositionControl);
-    }
-
-    public void setPercentOutput(double speed) {
-        m_motor.set(MathUtil.clamp(speed, -1.0, 1.0));
-    }
-
     public double getCurrentAngle() { return m_internalEncoder.getPosition(); }
-    public boolean atTarget(double tolerance) { return Math.abs(getCurrentAngle() - m_targetAngle) < tolerance; }
-    public void stop() { m_motor.stopMotor(); }
     public double getTargetAngle() { return m_targetAngle; }
     public double getRawAbs19() { return m_encoder19.getPosition(); }
     public double getRawAbs21() { return m_encoder21.getPosition(); }
+    public boolean atTarget() { return m_pidController.atGoal(); }
 
     @Override
     public void periodic() {
@@ -208,6 +243,7 @@ public class Turret extends SubsystemBase {
         SmartDashboard.putNumber("Turret/Target", m_targetAngle);
         SmartDashboard.putNumber("Turret/LiveCRTAngle", crtData[0]); 
         SmartDashboard.putNumber("Turret/CRTError", crtData[1]); 
+        SmartDashboard.putBoolean("Turret/AtSetpoint", atTarget());
         
         SmartDashboard.putNumber("Turret/Abs 19", getRawAbs19());
         SmartDashboard.putNumber("Turret/Abs 21", getRawAbs21());
